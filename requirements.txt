@@ -1,0 +1,4 @@
+gradio
+imageio
+imageio-ffmpeg
+loguru
