@@ -1,3 +1,14 @@
+import torch
+# use bfloat16 for the entire notebook
+torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+
+if torch.cuda.get_device_properties(0).major >= 8:
+    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+
+# torch.multiprocessing.set_start_method("spawn")
+
 import colorsys
 import datetime
 import os
@@ -7,23 +18,17 @@ import cv2
 import gradio as gr
 import imageio.v2 as iio
 import numpy as np
-import torch
+
 from loguru import logger as guru
-from mask_utils import init_sam_model
 
-# use bfloat16 for the entire notebook
-torch.autocast(device_type="cuda", dtype=torch.bfloat16).__enter__()
+from sam2.build_sam import build_sam2_video_predictor
 
-if torch.cuda.get_device_properties(0).major >= 8:
-    # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
+
 
 class PromptGUI(object):
-    def __init__(self, checkpoint_dir, model_cfg, device):
+    def __init__(self, checkpoint_dir, model_cfg):
         self.checkpoint_dir = checkpoint_dir
         self.model_cfg = model_cfg
-        self.device = device
         self.sam_model = None
         self.tracker = None
 
@@ -47,9 +52,9 @@ class PromptGUI(object):
 
     def init_sam_model(self):
         if self.sam_model is None:
-            self.sam_model = init_sam_model(
-                self.checkpoint_dir, self.model_cfg, self.device
-            )
+            self.sam_model = build_sam2_video_predictor(self.model_cfg, self.checkpoint_dir)
+            guru.info(f"loaded model checkpoint {self.checkpoint_dir}")
+
 
     def clear_points(self) -> tuple[None, None, str]:
         self.selected_points.clear()
@@ -133,7 +138,7 @@ class PromptGUI(object):
         self.selected_labels.append(self.cur_label_val)
         # masks, scores, logits if we want to update the mask
         masks = self.get_sam_mask(
-            frame_idx, np.array(self.selected_points), np.array(self.selected_labels)
+            frame_idx, np.array(self.selected_points, dtype=np.float32), np.array(self.selected_labels, dtype=np.int32)
         )
         mask = self.make_index_mask(masks)
 
@@ -148,14 +153,21 @@ class PromptGUI(object):
         return (H, W) mask, (H, W) logits
         """
         assert self.sam_model is not None
+        
 
-        _, out_obj_ids, out_mask_logits = self.sam_model.add_new_points_or_box(
-            inference_state=self.inference_state,
-            frame_idx=frame_idx,
-            obj_id=self.cur_mask_idx,
-            points=input_points,
-            labels=input_labels,
-        )
+        if torch.cuda.get_device_properties(0).major >= 8:
+            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, out_obj_ids, out_mask_logits = self.sam_model.add_new_points_or_box(
+                inference_state=self.inference_state,
+                frame_idx=frame_idx,
+                obj_id=self.cur_mask_idx,
+                points=input_points,
+                labels=input_labels,
+            )
 
         return  {
                 out_obj_id: (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
@@ -168,15 +180,19 @@ class PromptGUI(object):
         # read images and drop the alpha channel
         images = [iio.imread(p)[:, :, :3] for p in self.img_paths]
         
-        
-
         video_segments = {}  # video_segments contains the per-frame segmentation results
-        for out_frame_idx, out_obj_ids, out_mask_logits in self.sam_model.propagate_in_video(self.inference_state,start_frame_idx=0):
-            masks = {
-                out_obj_id: (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
-                for i, out_obj_id in enumerate(out_obj_ids)
-            }
-            video_segments[out_frame_idx] = masks
+        if torch.cuda.get_device_properties(0).major >= 8:
+            # turn on tfloat32 for Ampere GPUs (https://pytorch.org/docs/stable/notes/cuda.html#tensorfloat-32-tf32-on-ampere-devices)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+        
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            for out_frame_idx, out_obj_ids, out_mask_logits in self.sam_model.propagate_in_video(self.inference_state, start_frame_idx=0):
+                masks = {
+                    out_obj_id: (out_mask_logits[i] > 0.0).squeeze().cpu().numpy()
+                    for i, out_obj_id in enumerate(out_obj_ids)
+                }
+                video_segments[out_frame_idx] = masks
             # index_masks_all.append(self.make_index_mask(masks))
 
         self.index_masks_all = [self.make_index_mask(v) for k, v in video_segments.items()]
@@ -263,13 +279,12 @@ def listdir(vid_dir):
 def make_demo(
     checkpoint_dir,
     model_cfg,
-    device,
     root_dir,
     vid_name: str = "videos",
     img_name: str = "images",
     mask_name: str = "masks",
 ):
-    prompts = PromptGUI(checkpoint_dir, model_cfg, device)
+    prompts = PromptGUI(checkpoint_dir, model_cfg)
 
     start_instructions = (
         "Select a video file to extract frames from, "
@@ -520,12 +535,11 @@ if __name__ == "__main__":
     parser.add_argument("--mask_name", type=str, default="masks")
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # device = "cuda" if torch.cuda.is_available() else "cpu"
 
     demo = make_demo(
         args.checkpoint_dir,
         args.model_cfg,
-        device,
         args.root_dir,
         args.vid_name,
         args.img_name,
