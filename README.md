@@ -25,6 +25,7 @@ We highly encourage users to structure their data directories in the following w
 ```
 python mask_app.py --root_dir [data_root]
 ```
+![gradio interface](asset/gradio_interface.png)
 
 ## Acknowledge
 The app is modified based on [shape-of-motion](https://github.com/vye16/shape-of-motion/?tab=readme-ov-file).
