@@ -543,5 +543,6 @@ if __name__ == "__main__":
         args.root_dir,
         args.vid_name,
         args.img_name,
+        args.mask_name
     )
     demo.launch(server_port=args.port)
